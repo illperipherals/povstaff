@@ -1,0 +1,731 @@
+/*
+Persistence of vision  staff project by shurik179
+See https://github.com/shurik179/povstaff
+
+Distibuted under MIT license, see LICENSE file in this directory.
+
+For required libraries and support files, check
+https://github.com/shurik179/povstaff/code
+
+*/
+//first, include all libraries
+
+// C++ standard
+#include <vector>
+
+//NeoPixel
+#include <Adafruit_NeoPixel.h>
+
+//Filesystem-related
+#include <FS.h>
+#include <LittleFS.h>
+
+//WiFi and webserver
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WiFiClient.h>
+#include <WiFiAP.h>
+#include <WebServer.h>
+#include <ArduinoOTA.h>
+
+// BLE
+#include <NimBLEDevice.h>
+
+// Web file manager
+// #include <detail/RequestHandlersImpl.h>
+#include <ESPxWebFlMgr.h>
+
+//our own custom library
+#include <pov-esp32.h>
+#include "LSM6.h"
+
+
+
+// Now, various constants and defines
+
+const word filemanagerport = 8080;
+const char *ssid = "POVSTAFFXXXX";
+//when choosing a password, you must use at least 8 symbols
+const char *password = "XXXXXXXX";
+const char *FW_VERSION = "4.1";
+
+// POV Staff details
+#define PIN_VSENSE 9
+#define NUM_PIXELS 72
+
+
+// frame rate. Instead of using constant frame rate per second, we will adjust
+// depending on rotation speed
+
+// how many degrees of staff turn between successive lines?
+#define DEG_PER_LINE 1.0f
+// where is the list of images stored?
+static char imageListPath[] = "/imagelist.txt";
+//Finally, some colors
+#define RED 0xFF0000
+#define GREEN 0x00FF00
+#define BLUE 0x0000FF
+#define YELLOW 0xFFFF00
+#define PURPLE 0x8000FF
+
+
+// Now, global objects
+
+//the on-board NeoPixel
+Adafruit_NeoPixel pixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+
+
+ESPxWebFlMgr filemgr(filemanagerport); // we want a different port than the webserver
+WiFiServer server(80);
+
+LSM6 imu;
+POV staff(NUM_PIXELS);
+uint32_t lastIMUcheck = 0; //when did we last check IMU speed, in ms
+uint32_t lastPause = 0;    //when did we last pause/unpause staff, in ms
+uint32_t nextImageChange = 0;
+float speed=0.0;           //staff rotation speed, in deg/s
+static bool imuAvailable = false;
+static float manualSpeed = 360.0f;
+static bool imageLock = false;
+static int currentImageIndex = 0;
+static std::vector<String> imageNames;
+static bool otaEnabled = false;
+
+static const char *bleServiceUuid = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char *bleRxUuid = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char *bleTxUuid = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char *bleCurrentImageUuid = "6E400004-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char *bleNextImageUuid = "6E400005-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char *blePrevImageUuid = "6E400006-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char *bleLockUuid = "6E400007-B5A3-F393-E0A9-E50E24DCCA9E";
+static NimBLECharacteristic *bleTxCharacteristic = NULL;
+static NimBLECharacteristic *bleRxCharacteristic = NULL;
+static NimBLECharacteristic *bleCurrentImageCharacteristic = NULL;
+static NimBLECharacteristic *bleNextImageCharacteristic = NULL;
+static NimBLECharacteristic *blePrevImageCharacteristic = NULL;
+static NimBLECharacteristic *bleLockCharacteristic = NULL;
+static NimBLEServer *bleServer = NULL;
+static String lastBleResponse;
+
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD "changeme"
+#endif
+
+static const char *otaWifiSsid = "SSID";
+static const char *otaWifiPassword = "PASSWORD";
+
+void setNewImageChange();
+
+static int imageCount() {
+    return static_cast<int>(imageNames.size());
+}
+
+static String currentImageName() {
+    if (imageNames.empty()) {
+        return String();
+    }
+    if (currentImageIndex < 0 || currentImageIndex >= imageCount()) {
+        return String();
+    }
+    return imageNames[static_cast<size_t>(currentImageIndex)];
+}
+
+static void notifyBle(const String &message) {
+    if (!bleTxCharacteristic) {
+        return;
+    }
+    bleTxCharacteristic->setValue(message.c_str());
+    lastBleResponse = message;
+    if (!bleTxCharacteristic->notify()) {
+        Serial.print(F("BLE notify skipped: "));
+        Serial.println(message);
+    }
+}
+
+static void notifyStatus() {
+    String status = "status paused=";
+    status += (staff.paused ? "1" : "0");
+    status += " lock=";
+    status += (imageLock ? "1" : "0");
+    status += " index=";
+    status += currentImageIndex;
+    status += " name=";
+    status += currentImageName();
+    notifyBle(status);
+}
+
+static void updateBleLock(bool shouldNotify) {
+    if (!bleLockCharacteristic) {
+        return;
+    }
+    bleLockCharacteristic->setValue(imageLock ? "1" : "0");
+    if (shouldNotify) {
+        bleLockCharacteristic->notify();
+    }
+}
+
+static void updateBleCurrentImage(bool shouldNotify) {
+    if (!bleCurrentImageCharacteristic) {
+        return;
+    }
+    String value = String("index=") + currentImageIndex + " name=" + currentImageName();
+    bleCurrentImageCharacteristic->setValue(value.c_str());
+    if (shouldNotify) {
+        bleCurrentImageCharacteristic->notify();
+    }
+}
+
+static void notifyHelp() {
+    notifyBle(F("help: cmds help,list,status,next,prev,pause,resume,lock,unlock; aliases n,p,s,l,u,run,stop; select index:<n>,name:<filename>; test speed:<deg_per_sec> (IMU-less); note pair/bond required"));
+}
+
+static void setupOta() {
+    if (strcmp(otaWifiSsid, "YOUR_SSID") == 0) {
+        Serial.println(F("OTA WiFi not configured"));
+        return;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(otaWifiSsid, otaWifiPassword);
+    Serial.print(F("Connecting WiFi for OTA"));
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < 15000) {
+        delay(250);
+        Serial.print('.');
+    }
+    Serial.println();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println(F("OTA WiFi connect failed"));
+        return;
+    }
+
+    Serial.print(F("OTA WiFi connected, IP: "));
+    Serial.println(WiFi.localIP());
+
+    String hostname = String("POVStaff-") + FW_VERSION;
+    ArduinoOTA.setHostname(hostname.c_str());
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+    ArduinoOTA.begin();
+    otaEnabled = true;
+    Serial.print(F("OTA ready as: "));
+    Serial.println(hostname);
+}
+
+static bool setImageByIndex(int index) {
+    if (imageNames.empty()) {
+        return false;
+    }
+    if (index < 0 || index >= imageCount()) {
+        return false;
+    }
+
+    bool wasPaused = staff.paused;
+    if (wasPaused) {
+        staff.paused = false;
+    }
+
+    staff.firstImage();
+    currentImageIndex = 0;
+    for (int i = 0; i < index; i++) {
+        staff.nextImage();
+        currentImageIndex++;
+    }
+
+    if (wasPaused) {
+        staff.paused = true;
+        staff.blank();
+    }
+
+    setNewImageChange();
+    updateBleCurrentImage(true);
+    return true;
+}
+
+static bool advanceImage(int delta) {
+    if (imageNames.empty()) {
+        return false;
+    }
+    int count = imageCount();
+    int nextIndex = (currentImageIndex + delta) % count;
+    if (nextIndex < 0) {
+        nextIndex += count;
+    }
+    return setImageByIndex(nextIndex);
+}
+
+static int loadImageList() {
+    imageNames.clear();
+    File file = LittleFS.open(imageListPath, "r");
+    if (!file) {
+        Serial.print(F("Failed to open image list: "));
+        Serial.println(imageListPath);
+        return 0;
+    }
+
+    while (file.available()) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) {
+            continue;
+        }
+        if (line.startsWith("#")) {
+            continue;
+        }
+
+        int spaceIndex = line.indexOf(' ');
+        int tabIndex = line.indexOf('\t');
+        int splitIndex = -1;
+        if (spaceIndex >= 0 && tabIndex >= 0) {
+            splitIndex = (spaceIndex < tabIndex) ? spaceIndex : tabIndex;
+        } else if (spaceIndex >= 0) {
+            splitIndex = spaceIndex;
+        } else if (tabIndex >= 0) {
+            splitIndex = tabIndex;
+        }
+
+        String filename = (splitIndex >= 0) ? line.substring(0, splitIndex) : line;
+        filename.trim();
+        if (filename.length() > 0) {
+            imageNames.push_back(filename);
+        }
+    }
+
+    file.close();
+    currentImageIndex = 0;
+    return imageCount();
+}
+
+static void handleBleCommand(const String &command) {
+    String trimmed = command;
+    trimmed.trim();
+    if (trimmed.length() == 0) {
+        return;
+    }
+
+    Serial.print(F("BLE command: "));
+    Serial.println(trimmed);
+
+    String lower = trimmed;
+    lower.toLowerCase();
+
+    if (lower == "next") {
+        if (advanceImage(1)) {
+            notifyBle(F("ok next"));
+        } else {
+            notifyBle(F("err no images"));
+        }
+    } else if (lower == "prev") {
+        if (advanceImage(-1)) {
+            notifyBle(F("ok prev"));
+        } else {
+            notifyBle(F("err no images"));
+        }
+    } else if (lower == "pause") {
+        staff.paused = true;
+        staff.blank();
+        notifyBle(F("ok pause"));
+    } else if (lower == "resume") {
+        staff.paused = false;
+        setNewImageChange();
+        notifyBle(F("ok resume"));
+    } else if (lower == "lock") {
+        imageLock = true;
+        updateBleLock(true);
+        notifyBle(F("ok lock"));
+    } else if (lower == "unlock") {
+        imageLock = false;
+        setNewImageChange();
+        updateBleLock(true);
+        notifyBle(F("ok unlock"));
+    } else if (lower == "help") {
+        notifyHelp();
+    } else if (lower == "list") {
+        if (imageNames.empty()) {
+            notifyBle(F("err no images"));
+            return;
+        }
+        for (size_t i = 0; i < imageNames.size(); i++) {
+            String line = "image ";
+            line += static_cast<int>(i);
+            line += " ";
+            line += imageNames[i];
+            notifyBle(line);
+        }
+    } else if (lower.startsWith("index:")) {
+        String value = trimmed.substring(6);
+        value.trim();
+        int index = value.toInt();
+        if (setImageByIndex(index)) {
+            notifyBle(F("ok index"));
+        } else {
+            notifyBle(F("err index"));
+        }
+    } else if (lower.startsWith("name:")) {
+        String value = trimmed.substring(5);
+        value.trim();
+        if (value.length() == 0 || imageNames.empty()) {
+            notifyBle(F("err name"));
+            return;
+        }
+        bool found = false;
+        for (size_t i = 0; i < imageNames.size(); i++) {
+            if (imageNames[i] == value) {
+                found = setImageByIndex(static_cast<int>(i));
+                break;
+            }
+        }
+        notifyBle(found ? F("ok name") : F("err name"));
+    } else if (lower == "status") {
+        notifyStatus();
+    } else if (lower == "n") {
+        handleBleCommand("next");
+    } else if (lower == "p") {
+        handleBleCommand("prev");
+    } else if (lower == "s") {
+        handleBleCommand("status");
+    } else if (lower == "l") {
+        handleBleCommand("lock");
+    } else if (lower == "u") {
+        handleBleCommand("unlock");
+    } else if (lower == "run") {
+        handleBleCommand("resume");
+    } else if (lower == "stop") {
+        handleBleCommand("pause");
+    } else if (lower.startsWith("speed:")) {
+        String value = trimmed.substring(6);
+        value.trim();
+        float newSpeed = value.toFloat();
+        if (newSpeed <= 0.0f) {
+            notifyBle(F("err speed"));
+            return;
+        }
+        if (imuAvailable) {
+            notifyBle(F("err speed imuon"));
+            return;
+        }
+        manualSpeed = newSpeed;
+        speed = manualSpeed;
+        notifyBle(F("ok speed"));
+    } else {
+        notifyBle(F("err unknown"));
+    }
+}
+
+class BleServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
+        (void)server;
+        (void)connInfo;
+        Serial.println(F("BLE connected"));
+        notifyStatus();
+        updateBleCurrentImage(true);
+        updateBleLock(true);
+    }
+
+    void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
+        (void)server;
+        (void)connInfo;
+        (void)reason;
+        Serial.println(F("BLE disconnected"));
+        NimBLEDevice::startAdvertising();
+    }
+};
+
+class BleRxCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo) override {
+        if (!connInfo.isEncrypted()) {
+            Serial.println(F("BLE write rejected: not encrypted"));
+            NimBLEDevice::startSecurity(connInfo.getConnHandle());
+            notifyBle(F("err not paired"));
+            return;
+        }
+        std::string value = characteristic->getValue();
+        if (value.empty()) {
+            return;
+        }
+        handleBleCommand(String(value.c_str()));
+    }
+};
+
+class BleActionCallbacks : public NimBLECharacteristicCallbacks {
+  public:
+    explicit BleActionCallbacks(const String &action) : actionName(action) {}
+
+    void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo) override {
+        (void)characteristic;
+        if (!connInfo.isEncrypted()) {
+            Serial.println(F("BLE write rejected: not encrypted"));
+            NimBLEDevice::startSecurity(connInfo.getConnHandle());
+            notifyBle(F("err not paired"));
+            return;
+        }
+        if (actionName == "next") {
+            handleBleCommand("next");
+        } else if (actionName == "prev") {
+            handleBleCommand("prev");
+        } else if (actionName == "lock") {
+            std::string value = characteristic->getValue();
+            if (!value.empty() && (value[0] == '0' || value[0] == '1')) {
+                imageLock = (value[0] == '1');
+                updateBleLock(true);
+                notifyBle(imageLock ? F("ok lock") : F("ok unlock"));
+            } else {
+                handleBleCommand("lock");
+            }
+        }
+    }
+
+  private:
+    String actionName;
+};
+
+class BleTxCallbacks : public NimBLECharacteristicCallbacks {
+    void onSubscribe(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo, uint16_t subValue) override {
+        (void)characteristic;
+        (void)connInfo;
+        if (subValue) {
+            Serial.println(F("BLE notifications enabled"));
+            notifyBle(F("ok subscribed"));
+            if (lastBleResponse.length() > 0) {
+                notifyBle(lastBleResponse);
+            }
+        } else {
+            Serial.println(F("BLE notifications disabled"));
+        }
+    }
+};
+
+static void setupBle() {
+    String bleName = String("POVStaff-") + FW_VERSION;
+
+    NimBLEDevice::init(bleName.c_str());
+    NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND | BLE_SM_PAIR_AUTHREQ_SC);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+    NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
+    NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
+
+    bleServer = NimBLEDevice::createServer();
+    bleServer->setCallbacks(new BleServerCallbacks());
+
+    NimBLEService *service = bleServer->createService(bleServiceUuid);
+    bleTxCharacteristic = service->createCharacteristic(bleTxUuid, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    bleRxCharacteristic = service->createCharacteristic(bleRxUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    bleCurrentImageCharacteristic = service->createCharacteristic(bleCurrentImageUuid, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    bleNextImageCharacteristic = service->createCharacteristic(bleNextImageUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    blePrevImageCharacteristic = service->createCharacteristic(blePrevImageUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    bleLockCharacteristic = service->createCharacteristic(bleLockUuid, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
+    bleRxCharacteristic->setCallbacks(new BleRxCallbacks());
+    bleTxCharacteristic->setCallbacks(new BleTxCallbacks());
+    bleNextImageCharacteristic->setCallbacks(new BleActionCallbacks("next"));
+    blePrevImageCharacteristic->setCallbacks(new BleActionCallbacks("prev"));
+    bleLockCharacteristic->setCallbacks(new BleActionCallbacks("lock"));
+
+    NimBLEDescriptor *currentName = bleCurrentImageCharacteristic->createDescriptor("2901", NIMBLE_PROPERTY::READ, 32);
+    currentName->setValue("Current Image");
+    NimBLEDescriptor *nextName = bleNextImageCharacteristic->createDescriptor("2901", NIMBLE_PROPERTY::READ, 32);
+    nextName->setValue("Next Image");
+    NimBLEDescriptor *prevName = blePrevImageCharacteristic->createDescriptor("2901", NIMBLE_PROPERTY::READ, 32);
+    prevName->setValue("Previous Image");
+    NimBLEDescriptor *lockName = bleLockCharacteristic->createDescriptor("2901", NIMBLE_PROPERTY::READ, 32);
+    lockName->setValue("Image Lock");
+
+    service->start();
+
+    NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
+    NimBLEAdvertisementData advData;
+    advData.setName(bleName.c_str());
+    advData.setCompleteServices(NimBLEUUID(bleServiceUuid));
+    advertising->setAdvertisementData(advData);
+
+    NimBLEAdvertisementData scanData;
+    scanData.setName(bleName.c_str());
+    scanData.setCompleteServices(NimBLEUUID(bleServiceUuid));
+    advertising->setScanResponseData(scanData);
+    advertising->start();
+
+    Serial.print(F("BLE advertising as: "));
+    Serial.println(bleName);
+}
+
+
+
+void setup() {
+    // the usual Serial stuff....
+    Serial.begin(115200);
+    //deal with on-board neopixel
+    pixel.begin();
+    pixel.setPixelColor(0,GREEN);
+    pixel.show();
+    //initialize staff
+    Wire.begin();
+    staff.begin();
+    delay(500);
+    //measure battery voltage
+    pinMode(PIN_VSENSE, INPUT);
+    float voltage = analogReadMilliVolts(PIN_VSENSE)*0.001*2.0;
+    staff.showValue(voltage/3.7);
+    delay(2000);
+    Serial.print("Firmware version: "); Serial.println(FW_VERSION);
+    Serial.print("Voltage: "); Serial.println(voltage);
+    //clear both the staff and neopixel
+    staff.blank();
+    pixel.clear();pixel.show();
+    // Open LittleFS file system on the flash
+    if ( !LittleFS.begin(true) ) {
+        Serial.println("Error: filesystem doesn't not exist. Please format LittleFS filesystem");
+        while(1) {
+            pixel.setPixelColor(0,RED);pixel.show();
+            staff.blink();//blink red
+        }
+    }
+    // start the imu
+    imuAvailable = imu.init();
+    if (!imuAvailable) {
+        Serial.println("Failed to detect and initialize IMU!");
+        pixel.setPixelColor(0,YELLOW);pixel.show();
+        staff.blink(YELLOW);//blink yellow
+        Serial.println("Continuing without IMU for testing");
+    } else {
+        imu.enableDefault();
+        Serial.println("IMU Enabled");
+        staff.blink(GREEN);
+    }
+    //now, let us check which mode are we in
+    delay(1000);
+    if (imuAvailable) {
+        imu.read();
+    }
+    if (imuAvailable && imu.isHorizontal()){
+        //we need to go into uploader mode!
+        // let us start wifi, web server etc
+        WiFi.softAP(ssid, password);
+        IPAddress myIP = WiFi.softAPIP();
+        Serial.print("AP IP address: ");
+        Serial.println(myIP);
+        if (!MDNS.begin("povstaff")) {
+              Serial.println("Error setting up MDNS responder!");
+              while(1) {
+                  pixel.setPixelColor(0,PURPLE);pixel.show();
+                  staff.blink(PURPLE);//blink red
+              }
+        }
+        Serial.println("mDNS responder started");
+        server.begin();
+        MDNS.addService("http", "tcp", 80);
+        Serial.println("Server started");
+        setupWebserver();
+        filemgr.begin();
+        Serial.println("Filemanager started");
+        //light up staff in green
+        staff.blank();
+        for (int i=0; 4*i<NUM_PIXELS;i++){
+            staff.setPixel(4*i,GREEN); //set every 4th pixel green
+        }
+        staff.show();
+        pixel.setPixelColor(0,GREEN); pixel.show();
+        // start webserver loop
+        while(1){
+            filemgr.handleClient();
+            loopWebServer();
+        }
+    } else {
+        //normal mode - showing files from the list
+        loadImageList();
+        staff.addImageList(imageListPath);
+        Serial.println("imagelist added");
+        pixel.setPixelColor(0,BLUE); pixel.show();
+        staff.paused = true;
+        if (!imuAvailable) {
+            speed = manualSpeed;
+        }
+        setupOta();
+        setupBle();
+        updateBleCurrentImage(false);
+        updateBleLock(false);
+    }
+}
+
+//Note that loop will only be used in image show mode.
+void loop() {
+    if (otaEnabled) {
+        ArduinoOTA.handle();
+    }
+    //check IMU - do we need to pause the show?
+    if (!imuAvailable) {
+        if (!staff.paused) {
+            float rotAngle = speed * staff.timeSinceUpdate() * 0.000001;
+            if (rotAngle>DEG_PER_LINE) staff.showNextLine();
+            if (!imageLock && millis()>nextImageChange) {
+                staff.nextImage();
+                if (!imageNames.empty()) {
+                    currentImageIndex = (currentImageIndex + 1) % imageCount();
+                    updateBleCurrentImage(true);
+                }
+                setNewImageChange();
+            }
+        }
+        return;
+    }
+
+    if (millis()-lastIMUcheck > 50 ) {
+        //let's check if staff is at rest. To avoid overloading the MCU, we only do it 20 times/sec.
+        uint32_t now = millis();
+        lastIMUcheck = now;
+        imu.read();
+        //also, get  rotation speed (in deg/s)
+        speed = imu.getSpeed();
+        bool atRest=(imu.isVertical() && (speed < 30));
+        if (staff.paused && (now - lastPause>1000) && !atRest){
+            //if staff was paused for more than 1 sec and is now moving again, resume show
+            staff.paused = false;
+            //move to new image in the list - unless we are just starting and haven't yet shown any images, which can be detected from lastPause value
+            if (!imageLock) {
+                if (lastPause == 0) {
+                    staff.firstImage();
+                    currentImageIndex = 0;
+                    updateBleCurrentImage(true);
+                } else  {
+                    staff.nextImage();
+                    if (!imageNames.empty()) {
+                        currentImageIndex = (currentImageIndex + 1) % imageCount();
+                        updateBleCurrentImage(true);
+                    }
+                }
+            }
+            //determine when we will need to change the image
+            setNewImageChange();
+            lastPause = now;
+        } else if (!staff.paused && (now - lastPause>1000) && atRest){
+            //staff has been active for more than a  second, and now is stopped
+            staff.paused = true;
+            staff.blank();
+            lastPause = now;
+        } else if (staff.paused && (now-lastPause>30000)){
+            //blink every 30 seconds to remind the user
+            staff.blink();
+            lastPause = now;
+        }
+    }
+    if (!staff.paused){
+        float rotAngle = speed * staff.timeSinceUpdate() * 0.000001; //total rotation angle since last loop
+        if (rotAngle>DEG_PER_LINE) staff.showNextLine();
+        if (!imageLock && millis()>nextImageChange) {
+            //time to switch to next image
+            staff.nextImage();
+            if (!imageNames.empty()) {
+                currentImageIndex = (currentImageIndex + 1) % imageCount();
+                updateBleCurrentImage(true);
+            }
+            setNewImageChange();
+        }
+    }
+}
+
+void setNewImageChange(){
+    if (staff.currentDuration() == 0) {
+        nextImageChange = ULONG_MAX; //maximal possible unsigned 32-bit int
+    } else {
+        nextImageChange=millis()+staff.currentDuration()*1000;
+    }
+}
