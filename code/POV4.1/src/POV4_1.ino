@@ -111,8 +111,16 @@ static String lastBleResponse;
 #define OTA_PASSWORD "changeme"
 #endif
 
-static const char *otaWifiSsid = "SSID";
-static const char *otaWifiPassword = "PASSWORD";
+#ifndef OTA_WIFI_SSID
+#define OTA_WIFI_SSID "YOUR_SSID"
+#endif
+
+#ifndef OTA_WIFI_PASSWORD
+#define OTA_WIFI_PASSWORD "YOUR_PASSWORD"
+#endif
+
+static const char *otaWifiSsid = OTA_WIFI_SSID;
+static const char *otaWifiPassword = OTA_WIFI_PASSWORD;
 
 void setNewImageChange();
 

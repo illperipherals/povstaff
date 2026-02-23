@@ -66,8 +66,8 @@ pio device monitor --port /dev/cu.usbmodem101 --baud 115200
 
 ## OTA (push)
 OTA uses WiFi STA in normal mode and ArduinoOTA. Configure these before use:
-- Set `otaWifiSsid` / `otaWifiPassword` in `src/POV4_1.ino`.
-- Update the OTA password in `platformio.ini` (`OTA_PASSWORD` and `--auth`).
+- Set `OTA_WIFI_SSID` / `OTA_WIFI_PASSWORD` in `local.ini` (see `platformio.ini`).
+- Update the OTA password in `platformio.ini` (`OTA_PASSWORD` and `--auth`), or override in `local.ini`.
 
 Upload over OTA:
 ```
