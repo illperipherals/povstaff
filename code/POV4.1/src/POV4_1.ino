@@ -787,6 +787,7 @@ void setup() {
         while(1){
             filemgr.handleClient();
             loopWebServer();
+            delay(1);
         }
     } else {
         //normal mode - showing files from the list

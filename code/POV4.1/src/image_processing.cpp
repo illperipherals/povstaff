@@ -1,5 +1,5 @@
 #include "image_processing.h"
-#include <memory>
+#include <vector>
 
 static uint16_t read16(File &file) {
     uint16_t value = file.read();
@@ -113,68 +113,10 @@ ImageProcessResult processBmpToStaff(const char *srcPath,
         return result;
     }
 
-    uint8_t *outBuffer = static_cast<uint8_t *>(malloc(outSize));
-    if (!outBuffer) {
-        result.message = "Out of memory";
-        inFile.close();
-        return result;
-    }
-    memset(outBuffer, 0, outSize);
-
-    std::unique_ptr<uint8_t[]> rowBuffer(new uint8_t[inRowSize]);
-    if (!rowBuffer) {
-        free(outBuffer);
-        result.message = "Out of memory";
-        inFile.close();
-        return result;
-    }
-
-    for (int32_t y = 0; y < inHeight; y++) {
-        int32_t fileRow = topDown ? y : (inHeight - 1 - y);
-        uint32_t offset = dataOffset + static_cast<uint32_t>(fileRow) * inRowSize;
-        if (!inFile.seek(offset)) {
-            free(outBuffer);
-            result.message = "Failed to seek BMP";
-            inFile.close();
-            return result;
-        }
-        size_t readCount = inFile.read(rowBuffer.get(), inRowSize);
-        if (readCount != inRowSize) {
-            free(outBuffer);
-            result.message = "Failed to read BMP";
-            inFile.close();
-            return result;
-        }
-
-        for (int32_t x = 0; x < inWidth; x++) {
-            uint8_t b = rowBuffer[x * 3 + 0];
-            uint8_t g = rowBuffer[x * 3 + 1];
-            uint8_t r = rowBuffer[x * 3 + 2];
-
-            uint32_t srcX = static_cast<uint32_t>(x);
-            uint32_t srcY = static_cast<uint32_t>(y);
-            uint32_t rotX = rotateCw ? static_cast<uint32_t>(inHeight - 1 - srcY) : srcX;
-            uint32_t rotY = rotateCw ? srcX : srcY;
-
-            uint32_t outX = (rotX * outWidth) / virtualWidth;
-            uint32_t outY = (rotY * outHeight) / virtualHeight;
-            if (outX >= outWidth || outY >= outHeight) {
-                continue;
-            }
-            uint32_t outRow = (outHeight - 1 - outY);
-            uint32_t outPos = outRow * outRowSize + outX * 3;
-            outBuffer[outPos + 0] = b;
-            outBuffer[outPos + 1] = g;
-            outBuffer[outPos + 2] = r;
-        }
-    }
-
-    inFile.close();
-
     File outFile = LittleFS.open(destPath, "w");
     if (!outFile) {
-        free(outBuffer);
         result.message = "Failed to open output";
+        inFile.close();
         return result;
     }
 
@@ -195,9 +137,68 @@ ImageProcessResult processBmpToStaff(const char *srcPath,
     write32(outFile, 0);
     write32(outFile, 0);
 
-    outFile.write(outBuffer, outSize);
+    std::vector<uint8_t> rowBuffer(inRowSize);
+    std::vector<uint8_t> outRowBuffer(outRowSize);
+
+    int32_t cachedSrcY = -1;
+    for (int32_t outY = static_cast<int32_t>(outHeight) - 1; outY >= 0; outY--) {
+        memset(outRowBuffer.data(), 0, outRowSize);
+        for (uint32_t outX = 0; outX < outWidth; outX++) {
+            uint32_t rotX = (outX * virtualWidth) / outWidth;
+            uint32_t rotY = (static_cast<uint32_t>(outY) * virtualHeight) / outHeight;
+            if (rotX >= virtualWidth) {
+                rotX = virtualWidth - 1;
+            }
+            if (rotY >= virtualHeight) {
+                rotY = virtualHeight - 1;
+            }
+
+            uint32_t srcX = rotateCw ? rotY : rotX;
+            uint32_t srcY = rotateCw ? (static_cast<uint32_t>(inHeight) - 1 - rotX) : rotY;
+            if (srcX >= static_cast<uint32_t>(inWidth) || srcY >= static_cast<uint32_t>(inHeight)) {
+                continue;
+            }
+
+            if (static_cast<int32_t>(srcY) != cachedSrcY) {
+                int32_t fileRow = topDown ? static_cast<int32_t>(srcY) : (inHeight - 1 - static_cast<int32_t>(srcY));
+                uint32_t offset = dataOffset + static_cast<uint32_t>(fileRow) * inRowSize;
+                if (!inFile.seek(offset)) {
+                    result.message = "Failed to seek BMP";
+                    inFile.close();
+                    outFile.close();
+                    LittleFS.remove(destPath);
+                    return result;
+                }
+                size_t readCount = inFile.read(rowBuffer.data(), inRowSize);
+                if (readCount != inRowSize) {
+                    result.message = "Failed to read BMP";
+                    inFile.close();
+                    outFile.close();
+                    LittleFS.remove(destPath);
+                    return result;
+                }
+                cachedSrcY = static_cast<int32_t>(srcY);
+            }
+
+            uint32_t srcPos = srcX * 3;
+            uint32_t outPos = outX * 3;
+            outRowBuffer[outPos + 0] = rowBuffer[srcPos + 0];
+            outRowBuffer[outPos + 1] = rowBuffer[srcPos + 1];
+            outRowBuffer[outPos + 2] = rowBuffer[srcPos + 2];
+        }
+
+        size_t written = outFile.write(outRowBuffer.data(), outRowSize);
+        if (written != outRowSize) {
+            result.message = "Failed to write BMP";
+            inFile.close();
+            outFile.close();
+            LittleFS.remove(destPath);
+            return result;
+        }
+    }
+
+    inFile.close();
     outFile.close();
-    free(outBuffer);
 
     result.ok = true;
     result.message = "ok";

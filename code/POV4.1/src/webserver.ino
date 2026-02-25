@@ -11,6 +11,9 @@ static bool uploadRotateCw = false;
 static uint16_t uploadRequestedHeight = 0;
 static bool uploadReady = false;
 static bool uploadOk = false;
+static size_t uploadBytes = 0;
+static bool uploadTooLarge = false;
+static const size_t kMaxUploadBytes = 1024 * 1024;
 
 extern WebServer * webserver;
 extern const char kIndexHtml[];
@@ -127,17 +130,37 @@ static void handleApiUploadChunk() {
     uploadReady = true;
     uploadOk = false;
     uploadStatusMessage = "Upload failed";
+    uploadBytes = 0;
+    uploadTooLarge = false;
     String baseName = sanitizeBaseName(webserver->arg("name"));
     uploadDestPath = "/" + baseName + ".bmp";
     uploadRotateCw = webserver->arg("rotate") == "1";
-    uploadRequestedHeight = static_cast<uint16_t>(webserver->arg("columns").toInt());
+    uint16_t maxColumns = maxColumnsForWidth(STAFF_NUM_PIXELS);
+    int requested = webserver->arg("columns").toInt();
+    if (requested > 0) {
+      if (requested > static_cast<int>(maxColumns)) {
+        requested = static_cast<int>(maxColumns);
+      }
+      uploadRequestedHeight = static_cast<uint16_t>(requested);
+    } else {
+      uploadRequestedHeight = 0;
+    }
     uploadFile = LittleFS.open(uploadTempPath, "w");
     if (!uploadFile) {
       uploadStatusMessage = "Failed to open temp file";
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (uploadFile) {
-      uploadFile.write(upload.buf, upload.currentSize);
+      uploadBytes += upload.currentSize;
+      if (uploadBytes > kMaxUploadBytes) {
+        uploadTooLarge = true;
+        uploadStatusMessage = "Upload too large";
+      } else {
+        size_t written = uploadFile.write(upload.buf, upload.currentSize);
+        if (written != upload.currentSize) {
+          uploadStatusMessage = "Failed to write upload";
+        }
+      }
     }
   } else if (upload.status == UPLOAD_FILE_END) {
     if (!uploadFile) {
@@ -146,6 +169,11 @@ static void handleApiUploadChunk() {
       return;
     }
     uploadFile.close();
+    if (uploadTooLarge) {
+      uploadOk = false;
+      LittleFS.remove(uploadTempPath);
+      return;
+    }
     uint16_t maxColumns = maxColumnsForWidth(STAFF_NUM_PIXELS);
     ImageProcessResult result = processBmpToStaff(uploadTempPath.c_str(),
                                                   uploadDestPath.c_str(),
