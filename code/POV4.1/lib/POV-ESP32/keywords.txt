@@ -1,0 +1,34 @@
+#######################################
+# Syntax Coloring Map For POV library
+#######################################
+# Datatypes
+#######################################
+
+POV          	KEYWORD1
+BMPimage     	KEYWORD1
+BMPimageList 	KEYWORD1
+#######################################
+# Methods and Functions
+#######################################
+begin                 	KEYWORD2
+setPixel              	KEYWORD2
+blank                 	KEYWORD2
+show                  	KEYWORD2
+setBrightness         	KEYWORD2
+blink                 	KEYWORD2
+showValue             	KEYWORD2
+showLine              	KEYWORD2
+addImage              	KEYWORD2
+addImageList          	KEYWORD2
+clearImageList        	KEYWORD2
+firstImage            	KEYWORD2
+nextImage             	KEYWORD2
+restartImage          	KEYWORD2
+showNextLine          	KEYWORD2
+currentImage          	KEYWORD2
+currentDuration       	KEYWORD2
+timeSinceUpdate       	KEYWORD2
+
+#######################################
+# Constants
+#######################################
