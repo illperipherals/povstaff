@@ -144,6 +144,17 @@ static const char *otaWifiPassword = OTA_WIFI_PASSWORD;
 
 void setNewImageChange();
 
+static void blinkStatus(uint32_t color, uint8_t times, uint16_t onMs, uint16_t offMs) {
+    for (uint8_t i = 0; i < times; i++) {
+        pixel.setPixelColor(0, color);
+        pixel.show();
+        delay(onMs);
+        pixel.clear();
+        pixel.show();
+        delay(offMs);
+    }
+}
+
 static int imageCount() {
     return static_cast<int>(imageNames.size());
 }
@@ -330,6 +341,26 @@ static void setupOta() {
     Serial.println(F("mDNS service added: arduino tcp 3232"));
     ArduinoOTA.setHostname(hostname.c_str());
     ArduinoOTA.setPassword(OTA_PASSWORD);
+    ArduinoOTA.onStart([]() {
+        pixel.setPixelColor(0, BLUE);
+        pixel.show();
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        uint8_t level = (total > 0) ? static_cast<uint8_t>((progress * 255UL) / total) : 0;
+        pixel.setPixelColor(0, pixel.Color(0, 0, level));
+        pixel.show();
+    });
+    ArduinoOTA.onEnd([]() {
+        blinkStatus(GREEN, 3, 80, 80);
+        pixel.clear();
+        pixel.show();
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        (void)error;
+        blinkStatus(RED, 5, 80, 80);
+        pixel.setPixelColor(0, RED);
+        pixel.show();
+    });
     Serial.println(F("Starting ArduinoOTA..."));
     ArduinoOTA.begin();
     otaEnabled = true;
