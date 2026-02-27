@@ -11,6 +11,7 @@ https://github.com/shurik179/povstaff/code
 //first, include all libraries
 
 // C++ standard
+#include <cstdarg>
 #include <vector>
 
 //NeoPixel
@@ -113,6 +114,7 @@ static const char *bleNextImageUuid = "6E400005-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char *blePrevImageUuid = "6E400006-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char *bleLockUuid = "6E400007-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char *bleDebugUuid = "6E400008-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char *bleLogUuid = "6E400009-B5A3-F393-E0A9-E50E24DCCA9E";
 static NimBLECharacteristic *bleTxCharacteristic = NULL;
 static NimBLECharacteristic *bleRxCharacteristic = NULL;
 static NimBLECharacteristic *bleCurrentImageCharacteristic = NULL;
@@ -120,8 +122,12 @@ static NimBLECharacteristic *bleNextImageCharacteristic = NULL;
 static NimBLECharacteristic *blePrevImageCharacteristic = NULL;
 static NimBLECharacteristic *bleLockCharacteristic = NULL;
 static NimBLECharacteristic *bleDebugCharacteristic = NULL;
+static NimBLECharacteristic *bleLogCharacteristic = NULL;
 static NimBLEServer *bleServer = NULL;
 static String lastBleResponse;
+static bool bleLogEnabled = false;
+static uint32_t lastBleLogMs = 0;
+static const uint32_t bleLogIntervalMs = 200;
 
 #ifndef OTA_PASSWORD
 #define OTA_PASSWORD "changeme"
@@ -153,6 +159,34 @@ static void blinkStatus(uint32_t color, uint8_t times, uint16_t onMs, uint16_t o
         pixel.show();
         delay(offMs);
     }
+}
+
+static void logLine(const char *message) {
+    Serial.println(message);
+
+    if (!bleLogEnabled || !bleLogCharacteristic || !bleServer) {
+        return;
+    }
+    if (bleServer->getConnectedCount() == 0) {
+        return;
+    }
+    uint32_t now = millis();
+    if (now - lastBleLogMs < bleLogIntervalMs) {
+        return;
+    }
+
+    lastBleLogMs = now;
+    bleLogCharacteristic->setValue(message);
+    bleLogCharacteristic->notify();
+}
+
+static void logLinef(const char *fmt, ...) {
+    char buffer[180];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    logLine(buffer);
 }
 
 static int imageCount() {
@@ -215,7 +249,7 @@ static void updateBleCurrentImage(bool shouldNotify) {
 }
 
 static void notifyHelp() {
-    notifyBle(F("help: cmds help,list,status,next,prev,pause,resume,lock,unlock; aliases n,p,s,l,u,run,stop; select index:<n>,name:<filename>; test speed:<deg_per_sec> (IMU-less); BLE debug char supports 0/1/on/off; note pair/bond required"));
+    notifyBle(F("help: cmds help,list,status,next,prev,pause,resume,lock,unlock; aliases n,p,s,l,u,run,stop; select index:<n>,name:<filename>; test speed:<deg_per_sec> (IMU-less); BLE debug char supports 0/1/on/off and log on/off; note pair/bond required"));
 }
 
 static String normalizeOscAddress(const char *address) {
@@ -304,7 +338,7 @@ static void setupOsc() {
 
 static void setupOta() {
     if (strcmp(otaWifiSsid, "YOUR_SSID") == 0) {
-        Serial.println(F("OTA WiFi not configured"));
+        logLine("OTA WiFi not configured");
         return;
     }
 
@@ -320,25 +354,21 @@ static void setupOta() {
     Serial.println();
 
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println(F("OTA WiFi connect failed"));
+        logLine("OTA WiFi connect failed");
         return;
     }
 
-    Serial.print(F("OTA WiFi connected, IP: "));
-    Serial.println(WiFi.localIP());
-    Serial.print(F("OTA WiFi RSSI: "));
-    Serial.println(WiFi.RSSI());
+    logLinef("OTA WiFi connected, IP: %s", WiFi.localIP().toString().c_str());
+    logLinef("OTA WiFi RSSI: %d", WiFi.RSSI());
 
     String hostname = String("POVStaff");
     if (!MDNS.begin(hostname.c_str())) {
-        Serial.println(F("Error setting up MDNS responder"));
+        logLine("Error setting up mDNS responder");
         return;
     }
-    Serial.print(F("mDNS responder started: "));
-    Serial.print(hostname);
-    Serial.println(F(".local"));
+    logLinef("mDNS responder started: %s.local", hostname.c_str());
     MDNS.addService("arduino", "tcp", 3232);
-    Serial.println(F("mDNS service added: arduino tcp 3232"));
+    logLine("mDNS service added: arduino tcp 3232");
     ArduinoOTA.setHostname(hostname.c_str());
     ArduinoOTA.setPassword(OTA_PASSWORD);
     ArduinoOTA.onStart([]() {
@@ -361,7 +391,7 @@ static void setupOta() {
         pixel.setPixelColor(0, RED);
         pixel.show();
     });
-    Serial.println(F("Starting ArduinoOTA..."));
+    logLine("Starting ArduinoOTA...");
     ArduinoOTA.begin();
     otaEnabled = true;
     Serial.print(F("OTA ready as: "));
@@ -642,13 +672,13 @@ class BleTxCallbacks : public NimBLECharacteristicCallbacks {
         (void)characteristic;
         (void)connInfo;
         if (subValue) {
-            Serial.println(F("BLE notifications enabled"));
+            logLine("BLE notifications enabled");
             notifyBle(F("ok subscribed"));
             if (lastBleResponse.length() > 0) {
                 notifyBle(lastBleResponse);
             }
         } else {
-            Serial.println(F("BLE notifications disabled"));
+            logLine("BLE notifications disabled");
         }
     }
 };
@@ -667,6 +697,20 @@ class BleDebugCallbacks : public NimBLECharacteristicCallbacks {
         String trimmed = String(value.c_str());
         trimmed.trim();
         trimmed.toLowerCase();
+
+        if (trimmed.startsWith("log")) {
+            String arg = trimmed.substring(3);
+            arg.trim();
+            if (arg.length() == 0) {
+                bleLogEnabled = !bleLogEnabled;
+            } else if (arg == "1" || arg == "on" || arg == "true") {
+                bleLogEnabled = true;
+            } else if (arg == "0" || arg == "off" || arg == "false") {
+                bleLogEnabled = false;
+            }
+            notifyBle(bleLogEnabled ? F("ok log 1") : F("ok log 0"));
+            return;
+        }
 
         bool next = imuDebugEnabled;
         if (trimmed.length() == 0) {
@@ -704,6 +748,7 @@ static void setupBle() {
     blePrevImageCharacteristic = service->createCharacteristic(blePrevImageUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
     bleLockCharacteristic = service->createCharacteristic(bleLockUuid, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
     bleDebugCharacteristic = service->createCharacteristic(bleDebugUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    bleLogCharacteristic = service->createCharacteristic(bleLogUuid, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
     bleRxCharacteristic->setCallbacks(new BleRxCallbacks());
     bleTxCharacteristic->setCallbacks(new BleTxCallbacks());
     bleNextImageCharacteristic->setCallbacks(new BleActionCallbacks("next"));
@@ -719,6 +764,8 @@ static void setupBle() {
     prevName->setValue("Previous Image");
     NimBLEDescriptor *lockName = bleLockCharacteristic->createDescriptor("2901", NIMBLE_PROPERTY::READ, 32);
     lockName->setValue("Image Lock");
+    NimBLEDescriptor *logName = bleLogCharacteristic->createDescriptor("2901", NIMBLE_PROPERTY::READ, 32);
+    logName->setValue("Debug Log");
 
     service->start();
 
