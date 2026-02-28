@@ -1018,8 +1018,9 @@ void loop() {
             staff.paused = true;
             staff.blank();
             lastPause = now;
-        } else if (staff.paused && (now-lastPause>30000)){
-            //blink every 30 seconds to remind the user
+        } else if (staff.paused && (now-lastPause>10000)){
+            //rainbow reminder every 10 seconds while paused
+            logLine("Pause reminder");
             runRainbowReminder(NUM_PIXELS, 20);
             lastPause = now;
         }
