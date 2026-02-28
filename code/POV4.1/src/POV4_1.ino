@@ -176,10 +176,11 @@ static uint32_t colorWheel(uint8_t pos) {
     return (pos * 3) << 16 | ((255 - pos * 3) << 8);
 }
 
-static void runRainbowReminder(uint8_t steps, uint16_t delayMs) {
-    for (uint8_t step = 0; step < steps; step++) {
+static void runRainbowReminder(uint16_t steps, uint16_t delayMs) {
+    for (uint16_t step = 0; step < steps; step++) {
+        uint8_t shift = static_cast<uint8_t>((step * 8) & 0xFF);
         for (uint16_t i = 0; i < NUM_PIXELS; i++) {
-            uint8_t colorIndex = static_cast<uint8_t>((i * 256 / NUM_PIXELS) + step);
+            uint8_t colorIndex = static_cast<uint8_t>((i * 256 / NUM_PIXELS) + shift);
             staff.setPixel(i, colorWheel(colorIndex));
         }
         staff.show();
@@ -1019,7 +1020,7 @@ void loop() {
             lastPause = now;
         } else if (staff.paused && (now-lastPause>30000)){
             //blink every 30 seconds to remind the user
-            runRainbowReminder(24, 30);
+            runRainbowReminder(NUM_PIXELS, 20);
             lastPause = now;
         }
     }
