@@ -34,6 +34,9 @@ https://github.com/shurik179/povstaff/code
 // BLE
 #include <NimBLEDevice.h>
 
+// ESP32 reset reason
+#include <esp_system.h>
+
 // Web file manager
 // #include <detail/RequestHandlersImpl.h>
 #include <ESPxWebFlMgr.h>
@@ -210,6 +213,33 @@ static void logLinef(const char *fmt, ...) {
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
     logLine(buffer);
+}
+
+static const char *resetReasonToString(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON:
+            return "power on";
+        case ESP_RST_EXT:
+            return "external reset";
+        case ESP_RST_SW:
+            return "software reset";
+        case ESP_RST_PANIC:
+            return "panic";
+        case ESP_RST_INT_WDT:
+            return "interrupt watchdog";
+        case ESP_RST_TASK_WDT:
+            return "task watchdog";
+        case ESP_RST_WDT:
+            return "other watchdog";
+        case ESP_RST_DEEPSLEEP:
+            return "deep sleep";
+        case ESP_RST_BROWNOUT:
+            return "brownout";
+        case ESP_RST_SDIO:
+            return "SDIO";
+        default:
+            return "unknown";
+    }
 }
 
 static int imageCount() {
@@ -813,6 +843,7 @@ static void setupBle() {
 void setup() {
     // the usual Serial stuff....
     Serial.begin(115200);
+    logLinef("Reset reason: %s", resetReasonToString(esp_reset_reason()));
     //deal with on-board neopixel
     pixel.begin();
     pixel.setPixelColor(0,GREEN);
