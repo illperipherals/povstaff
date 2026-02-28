@@ -52,7 +52,7 @@ const char *ssid = "POVSTAFFXXXX";
 //when choosing a password, you must use at least 8 symbols
 const char *password = "XXXXXXXX";
 #ifndef FW_VERSION_STR
-#define FW_VERSION_STR "4.5"
+#define FW_VERSION_STR "4.6"
 #endif
 const char *FW_VERSION = FW_VERSION_STR;
 
@@ -158,6 +158,29 @@ static void blinkStatus(uint32_t color, uint8_t times, uint16_t onMs, uint16_t o
         pixel.clear();
         pixel.show();
         delay(offMs);
+    }
+}
+
+static uint32_t colorWheel(uint8_t pos) {
+    if (pos < 85) {
+        return ((255 - pos * 3) << 16) | (pos * 3);
+    }
+    if (pos < 170) {
+        pos -= 85;
+        return ((pos * 3) << 8) | (255 - pos * 3);
+    }
+    pos -= 170;
+    return (pos * 3) << 16 | ((255 - pos * 3) << 8);
+}
+
+static void runRainbowReminder(uint8_t steps, uint16_t delayMs) {
+    for (uint8_t step = 0; step < steps; step++) {
+        for (uint16_t i = 0; i < NUM_PIXELS; i++) {
+            uint8_t colorIndex = static_cast<uint8_t>((i * 256 / NUM_PIXELS) + step);
+            staff.setPixel(i, colorWheel(colorIndex));
+        }
+        staff.show();
+        delay(delayMs);
     }
 }
 
@@ -965,7 +988,7 @@ void loop() {
             lastPause = now;
         } else if (staff.paused && (now-lastPause>30000)){
             //blink every 30 seconds to remind the user
-            staff.blink();
+            runRainbowReminder(24, 30);
             lastPause = now;
         }
     }
